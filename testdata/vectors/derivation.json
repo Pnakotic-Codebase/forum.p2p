@@ -1,0 +1,321 @@
+{
+  "suite": "forum-spec/publication-key-derivation",
+  "rule": "mldsa65_seed = first 32 bytes of Skein-512-512(frame(\"forum:v0:publication-key\", master_seed, kind, value)); kind 0x00 counter (value u64 big-endian), 0x01 custom (value = UTF-8 bytes of the normalized salt, non-empty)",
+  "normalization": "casefold, NFKD, drop Mn, map ø ł đ ħ ı ŀ ŧ æ œ ß þ ð ŋ ĸ, collapse runs of whitespace (Go unicode.IsSpace) to one space and trim, NFC",
+  "vectors": [
+    {
+      "id": "drv-001",
+      "description": "master seq(0x00), counter 0",
+      "master_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "salt_kind": "counter",
+      "salt_value_hex": "0000000000000000",
+      "mldsa65_seed_hex": "269efbe5aa89742ef54dd1f387d9b19491830cf8b798320d80d7951eb4ac4c7b"
+    },
+    {
+      "id": "drv-002",
+      "description": "master seq(0x00), counter 1",
+      "master_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "salt_kind": "counter",
+      "salt_value_hex": "0000000000000001",
+      "mldsa65_seed_hex": "f0409b35a06d159d7d21f6c9e6a4a0bb6d0dd336f76fddc565c7996e1bc6e986"
+    },
+    {
+      "id": "drv-003",
+      "description": "master seq(0x00), counter 2^64-1",
+      "master_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "salt_kind": "counter",
+      "salt_value_hex": "ffffffffffffffff",
+      "mldsa65_seed_hex": "cba88a6321c01c3c857cda68c17db3a5de6f0de8443d8daea974f6cc5d99c86e"
+    },
+    {
+      "id": "drv-004",
+      "description": "master seq(0x00), custom \"my poetry blog\"",
+      "master_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "salt_kind": "custom",
+      "salt_input": "my poetry blog",
+      "salt_value_hex": "6d7920706f6574727920626c6f67",
+      "mldsa65_seed_hex": "25beb6815f4b52b4f7dc77148178bc49553e169c338b298db3d6f8718f1c9947"
+    },
+    {
+      "id": "drv-005",
+      "description": "master seq(0x00), custom \"secret01\"",
+      "master_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "salt_kind": "custom",
+      "salt_input": "secret01",
+      "salt_value_hex": "7365637265743031",
+      "mldsa65_seed_hex": "73f84bc116dead4a749d261343d4c4fcd8d14dfa1b4bf476a553bfb1bf080059"
+    },
+    {
+      "id": "drv-006",
+      "description": "master seq(0x00), custom UTF-8 \"Grøstl → Skein\"",
+      "master_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "salt_kind": "custom",
+      "salt_input": "Grøstl → Skein",
+      "salt_value_hex": "67726f73746c20e2869220736b65696e",
+      "mldsa65_seed_hex": "b6e8fe41db95b2e5e8893f3533b736ac6aead9fa1319984a9c5598e7c74dc1e9"
+    },
+    {
+      "id": "drv-007",
+      "description": "master seq(0x00), custom whose bytes equal counter 1",
+      "master_seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "salt_kind": "custom",
+      "salt_input": "\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0001",
+      "salt_value_hex": "0000000000000001",
+      "mldsa65_seed_hex": "3f15623ad2bed4f3c852060535822e0b306d9b72a85679b6fc5512e7f9c20e28"
+    },
+    {
+      "id": "drv-008",
+      "description": "master fill(0x42), counter 0",
+      "master_seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "salt_kind": "counter",
+      "salt_value_hex": "0000000000000000",
+      "mldsa65_seed_hex": "427c3124c4caa00c535248b2a98aa729ce13c6f2b3cb78afd218fee000b7a708"
+    },
+    {
+      "id": "drv-009",
+      "description": "master fill(0x42), counter 1",
+      "master_seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "salt_kind": "counter",
+      "salt_value_hex": "0000000000000001",
+      "mldsa65_seed_hex": "ecbaeb234ba1dcf6ecae5662144c1a39b18f04b6148580753879d75c4b880845"
+    },
+    {
+      "id": "drv-010",
+      "description": "master fill(0x42), counter 2^64-1",
+      "master_seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "salt_kind": "counter",
+      "salt_value_hex": "ffffffffffffffff",
+      "mldsa65_seed_hex": "7b5438f77182805d43c5de778ff091ba53ad96e8ef430e9089d16ff8c2e2e6a1"
+    },
+    {
+      "id": "drv-011",
+      "description": "master fill(0x42), custom \"my poetry blog\"",
+      "master_seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "salt_kind": "custom",
+      "salt_input": "my poetry blog",
+      "salt_value_hex": "6d7920706f6574727920626c6f67",
+      "mldsa65_seed_hex": "ec50ef6073743315e965b12db9a394bbbc77acaf90306ca1ceb635bbe15909ec"
+    },
+    {
+      "id": "drv-012",
+      "description": "master fill(0x42), custom \"secret01\"",
+      "master_seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "salt_kind": "custom",
+      "salt_input": "secret01",
+      "salt_value_hex": "7365637265743031",
+      "mldsa65_seed_hex": "fd88412bb4495ac1125da03f76991e7cdc59784b3a5d98fd47443997fac8d5e3"
+    },
+    {
+      "id": "drv-013",
+      "description": "master fill(0x42), custom UTF-8 \"Grøstl → Skein\"",
+      "master_seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "salt_kind": "custom",
+      "salt_input": "Grøstl → Skein",
+      "salt_value_hex": "67726f73746c20e2869220736b65696e",
+      "mldsa65_seed_hex": "c92169d9647c10de850a4c27e706fdbba7cc50988f58b3d40f5605b12578daef"
+    },
+    {
+      "id": "drv-014",
+      "description": "master fill(0x42), custom whose bytes equal counter 1",
+      "master_seed_hex": "4242424242424242424242424242424242424242424242424242424242424242",
+      "salt_kind": "custom",
+      "salt_input": "\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0001",
+      "salt_value_hex": "0000000000000001",
+      "mldsa65_seed_hex": "dd97fd0766b1f558decd87d8723c5bd9a8cdf33ca139a86715baf5637ac2b1fc"
+    }
+  ],
+  "normalization_vectors": [
+    {
+      "id": "nrm-001",
+      "input": "café",
+      "normalized": "cafe",
+      "normalized_hex": "63616665"
+    },
+    {
+      "id": "nrm-002",
+      "input": "CAFÉ",
+      "normalized": "cafe",
+      "normalized_hex": "63616665"
+    },
+    {
+      "id": "nrm-003",
+      "input": "Cafe",
+      "normalized": "cafe",
+      "normalized_hex": "63616665"
+    },
+    {
+      "id": "nrm-004",
+      "input": "café",
+      "normalized": "cafe",
+      "normalized_hex": "63616665"
+    },
+    {
+      "id": "nrm-005",
+      "input": "  Café  ",
+      "normalized": "cafe",
+      "normalized_hex": "63616665"
+    },
+    {
+      "id": "nrm-006",
+      "input": "café ",
+      "normalized": "cafe",
+      "normalized_hex": "63616665"
+    },
+    {
+      "id": "nrm-007",
+      "input": "My Poetry Blog",
+      "normalized": "my poetry blog",
+      "normalized_hex": "6d7920706f6574727920626c6f67"
+    },
+    {
+      "id": "nrm-008",
+      "input": "my  poetry\tblog",
+      "normalized": "my poetry blog",
+      "normalized_hex": "6d7920706f6574727920626c6f67"
+    },
+    {
+      "id": "nrm-009",
+      "input": " MY POETRY BLOG\n",
+      "normalized": "my poetry blog",
+      "normalized_hex": "6d7920706f6574727920626c6f67"
+    },
+    {
+      "id": "nrm-010",
+      "input": "Mý Pöetry Blög",
+      "normalized": "my poetry blog",
+      "normalized_hex": "6d7920706f6574727920626c6f67"
+    },
+    {
+      "id": "nrm-011",
+      "input": "Smørrebrød",
+      "normalized": "smorrebrod",
+      "normalized_hex": "736d6f72726562726f64"
+    },
+    {
+      "id": "nrm-012",
+      "input": "SMØRREBRØD",
+      "normalized": "smorrebrod",
+      "normalized_hex": "736d6f72726562726f64"
+    },
+    {
+      "id": "nrm-013",
+      "input": "Straße",
+      "normalized": "strasse",
+      "normalized_hex": "73747261737365"
+    },
+    {
+      "id": "nrm-014",
+      "input": "STRASSE",
+      "normalized": "strasse",
+      "normalized_hex": "73747261737365"
+    },
+    {
+      "id": "nrm-015",
+      "input": "strasse",
+      "normalized": "strasse",
+      "normalized_hex": "73747261737365"
+    },
+    {
+      "id": "nrm-016",
+      "input": "İstanbul",
+      "normalized": "istanbul",
+      "normalized_hex": "697374616e62756c"
+    },
+    {
+      "id": "nrm-017",
+      "input": "ISTANBUL",
+      "normalized": "istanbul",
+      "normalized_hex": "697374616e62756c"
+    },
+    {
+      "id": "nrm-018",
+      "input": "istanbul",
+      "normalized": "istanbul",
+      "normalized_hex": "697374616e62756c"
+    },
+    {
+      "id": "nrm-019",
+      "input": "ﬁancée",
+      "normalized": "fiancee",
+      "normalized_hex": "6669616e636565"
+    },
+    {
+      "id": "nrm-020",
+      "input": "Fiancée",
+      "normalized": "fiancee",
+      "normalized_hex": "6669616e636565"
+    },
+    {
+      "id": "nrm-021",
+      "input": "ΣΟΦΙΑ",
+      "normalized": "σοφια",
+      "normalized_hex": "cf83cebfcf86ceb9ceb1"
+    },
+    {
+      "id": "nrm-022",
+      "input": "σοφία",
+      "normalized": "σοφια",
+      "normalized_hex": "cf83cebfcf86ceb9ceb1"
+    },
+    {
+      "id": "nrm-023",
+      "input": "Σοφία",
+      "normalized": "σοφια",
+      "normalized_hex": "cf83cebfcf86ceb9ceb1"
+    },
+    {
+      "id": "nrm-024",
+      "input": "東京",
+      "normalized": "東京",
+      "normalized_hex": "e69db1e4baac"
+    },
+    {
+      "id": "nrm-025",
+      "input": " 東京 ",
+      "normalized": "東京",
+      "normalized_hex": "e69db1e4baac"
+    },
+    {
+      "id": "nrm-026",
+      "input": "Æon",
+      "normalized": "aeon",
+      "normalized_hex": "61656f6e"
+    },
+    {
+      "id": "nrm-027",
+      "input": "æon",
+      "normalized": "aeon",
+      "normalized_hex": "61656f6e"
+    },
+    {
+      "id": "nrm-028",
+      "input": "AEON",
+      "normalized": "aeon",
+      "normalized_hex": "61656f6e"
+    },
+    {
+      "id": "nrm-029",
+      "input": "",
+      "normalized": "",
+      "expect_error": "custom salt is empty after normalization"
+    },
+    {
+      "id": "nrm-030",
+      "input": "   ",
+      "normalized": "",
+      "expect_error": "custom salt is empty after normalization"
+    },
+    {
+      "id": "nrm-031",
+      "input": "́",
+      "normalized": "",
+      "expect_error": "custom salt is empty after normalization"
+    },
+    {
+      "id": "nrm-032",
+      "input": "\t  ",
+      "normalized": "",
+      "expect_error": "custom salt is empty after normalization"
+    }
+  ]
+}
