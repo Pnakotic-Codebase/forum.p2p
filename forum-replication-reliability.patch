@@ -1,0 +1,1236 @@
+From bff409eeee01129f674ce7132a92b29ea48d650d Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Mon, 19 Oct 2026 13:33:51 -0400
+Subject: [PATCH 1/2] Fix replica freshness by checking all known copies
+
+---
+ README.md             |   4 +
+ e2e/freshness_test.go | 172 ++++++++++++++++++++++++++++++++++++++++++
+ node/fetch.go         |  36 ++++++++-
+ spec/SPEC.md          |   6 ++
+ 4 files changed, 216 insertions(+), 2 deletions(-)
+ create mode 100644 e2e/freshness_test.go
+
+diff --git a/README.md b/README.md
+index 8d7a9a2..7a1f4ed 100644
+--- a/README.md
++++ b/README.md
+@@ -35,6 +35,10 @@ forum read forum://<publication>
+ 
+ Anything that fails a check is reported as UNVERIFIED with the failing check and is never stored (`forum log`).
+ 
++Fetch, follow and sync try every known copy, including locations learned from verified publications, and retain the
++highest fully verified head sequence. Each location is tried once per fetch. An unavailable or invalid copy does not
++discard a successful result; a newer version can only be found if one of the reachable copies carries it.
++
+ ## People and agents, as equals
+ 
+ forum:// makes no distinction between a person and an AI, as reader or as author. Markdown is the native form, and
+diff --git a/e2e/freshness_test.go b/e2e/freshness_test.go
+new file mode 100644
+index 0000000..063e3d1
+--- /dev/null
++++ b/e2e/freshness_test.go
+@@ -0,0 +1,172 @@
++package e2e
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"github.com/Pnakotic-Codebase/forum.p2p/addr"
++	"github.com/Pnakotic-Codebase/forum.p2p/node"
++	"github.com/Pnakotic-Codebase/forum.p2p/obj"
++	"github.com/Pnakotic-Codebase/forum.p2p/web"
++)
++
++func snapshot(t *testing.T, author *node.Node, pub addr.ID) *node.Node {
++	t.Helper()
++	b, err := author.Export(pub)
++	must(t, err)
++	n := open(t)
++	if _, f, err := n.Import(b, "snapshot"); err != nil || f != nil {
++		t.Fatalf("snapshot: %v %v", f, err)
++	}
++	return n
++}
++
++func TestFetchNewestReplica(t *testing.T) {
++	author := open(t)
++	words, err := author.Init()
++	must(t, err)
++	pub, err := author.NewPublication("", "Notes", "", nil)
++	must(t, err)
++	doc, err := author.Publish(pub, node.Draft{Kind: obj.Post, Title: "Post", Body: "old"})
++	must(t, err)
++	old := snapshot(t, author, pub)
++	oldURL := host(t, old).URL
++	_, err = author.Publish(pub, node.Draft{Document: doc.String(), Title: "Post", Body: "middle"})
++	must(t, err)
++	middle := snapshot(t, author, pub)
++	middleURL := host(t, middle).URL
++
++	// A second writer with the same key creates a different head at the same sequence.
++	fork := snapshot(t, author, pub)
++	must(t, fork.Restore(strings.Join(words, " ")))
++	_, err = fork.Adopt("", 0)
++	must(t, err)
++	_, err = fork.Publish(pub, node.Draft{Document: doc.String(), Title: "Fork", Body: "conflicting"})
++	must(t, err)
++	forkURL := host(t, fork).URL
++
++	_, err = author.Publish(pub, node.Draft{Document: doc.String(), Title: "Post", Body: "newest"})
++	must(t, err)
++	newURL := host(t, author).URL
++	newHead, err := author.Store.HeadEnv(pub)
++	must(t, err)
++	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if strings.HasSuffix(r.URL.Path, "/head") {
++			w.Write(newHead)
++			return
++		}
++		w.Write([]byte("corrupt revision"))
++	}))
++	defer bad.Close()
++	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		http.Error(w, "unavailable", http.StatusServiceUnavailable)
++	}))
++	defer down.Close()
++
++	for _, tc := range []struct {
++		name      string
++		from      []string
++		want      *node.Node
++		location  string
++		wantError bool
++	}{
++		{"old then middle then new", []string{oldURL, middleURL, newURL}, author, newURL, false},
++		{"new then old", []string{newURL, oldURL}, author, newURL, true},
++		{"new then same", []string{newURL, host(t, author).URL}, author, newURL, false},
++		{"unavailable then new", []string{down.URL, newURL}, author, newURL, true},
++		{"new then unavailable", []string{newURL, down.URL}, author, newURL, true},
++		{"corrupt newest then middle", []string{bad.URL, middleURL}, middle, middleURL, true},
++		{"new then conflicting", []string{newURL, forkURL}, author, newURL, true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			reader := open(t)
++			r, errs := reader.Fetch(context.Background(), pub, tc.from...)
++			if r == nil || r.Failure != nil {
++				t.Fatalf("fetch failed: %+v %v", r, errs)
++			}
++			if (len(errs) > 0) != tc.wantError {
++				t.Fatalf("errors: %v, want errors: %v", errs, tc.wantError)
++			}
++			want, err := tc.want.Store.HeadEnv(pub)
++			must(t, err)
++			got, err := reader.Store.HeadEnv(pub)
++			must(t, err)
++			if !bytes.Equal(got, want) || !bytes.Equal(r.Publication.HeadEnv, want) || r.Location != tc.location || r.Unchanged {
++				t.Fatalf("wrong result or stored head: location=%s unchanged=%v sequence=%d", r.Location, r.Unchanged, r.Publication.Head.Sequence)
++			}
++		})
++	}
++}
++
++func TestFollowAndSyncDiscoverCopies(t *testing.T) {
++	author := open(t)
++	_, err := author.Init()
++	must(t, err)
++	stale := open(t)
++	staleHost := host(t, stale)
++	var heads atomic.Int32
++	public := web.NewPublic(author)
++	current := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if strings.HasSuffix(r.URL.Path, "/head") {
++			heads.Add(1)
++		}
++		public.ServeHTTP(w, r)
++	}))
++	defer current.Close()
++	pub, err := author.NewPublication("", "Notes", "", []string{current.URL, " " + current.URL + "/ ", staleHost.URL})
++	must(t, err)
++	doc, err := author.Publish(pub, node.Draft{Kind: obj.Post, Title: "Post", Body: "old"})
++	must(t, err)
++	res, err := stale.FetchFrom(context.Background(), pub, current.URL)
++	must(t, err)
++	if res.Failure != nil {
++		t.Fatal(res.Failure)
++	}
++	_, err = author.Publish(pub, node.Draft{Document: doc.String(), Title: "Post", Body: "new"})
++	must(t, err)
++	heads.Store(0)
++	reader := open(t)
++	r, errs := reader.Follow(context.Background(), pub, staleHost.URL)
++	if r == nil || r.Failure != nil || r.Publication.Head.Sequence != 3 || r.Unchanged || len(errs) != 0 || heads.Load() != 1 {
++		t.Fatalf("follow missed newly discovered copy or fetched it repeatedly: %+v %v heads=%d", r, errs, heads.Load())
++	}
++	_, err = author.Publish(pub, node.Draft{Document: doc.String(), Title: "Post", Body: "newer"})
++	must(t, err)
++	reports, err := reader.Sync(context.Background())
++	must(t, err)
++	if len(reports) != 1 || reports[0].Result == nil || reports[0].Result.Failure != nil || reports[0].Result.Publication.Head.Sequence != 4 || reports[0].Result.Unchanged {
++		t.Fatalf("sync stopped at stale origin: %+v", reports)
++	}
++	r, _ = reader.Fetch(context.Background(), pub, current.URL)
++	if r == nil || r.Failure != nil || !r.Unchanged {
++		t.Fatalf("unchanged fetch: %+v", r)
++	}
++}
++
++func TestFetchWithoutSuccessfulReplica(t *testing.T) {
++	reader := open(t)
++	pub, err := addr.Parse(strings.Repeat("0", addr.Length))
++	must(t, err)
++	r, errs := reader.Fetch(context.Background(), pub)
++	if r != nil || len(errs) != 1 || !strings.Contains(errs[0].Error(), "no location known") {
++		t.Fatalf("no locations: %+v %v", r, errs)
++	}
++	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("bad")) }))
++	defer bad.Close()
++	r, errs = reader.Fetch(context.Background(), pub, bad.URL)
++	if r == nil || r.Failure == nil || len(errs) != 1 {
++		t.Fatalf("invalid replica: %+v %v", r, errs)
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	r, errs = reader.Fetch(ctx, pub, bad.URL, bad.URL+"/other")
++	if r != nil || len(errs) != 1 || !errors.Is(errs[0], context.Canceled) {
++		t.Fatalf("cancellation: %+v %v", r, errs)
++	}
++}
+diff --git a/node/fetch.go b/node/fetch.go
+index e4045d4..24cac8a 100644
+--- a/node/fetch.go
++++ b/node/fetch.go
+@@ -129,19 +129,51 @@ func (n *Node) Locations(a addr.ID, first ...string) []string {
+ 
+ func (n *Node) Fetch(ctx context.Context, a addr.ID, first ...string) (*FetchResult, []error) {
+ 	var errs []error
++	var best *FetchResult
+ 	var lastFail *FetchResult
+-	for _, l := range n.Locations(a, first...) {
++	locations := n.Locations(a, first...)
++	seen := make(map[string]bool, len(locations))
++	for _, l := range locations {
++		seen[l] = true
++	}
++	// Continue past a valid response: another copy may have a newer signed head.
++	// Each normalized location is tried once, including hints learned along the way.
++	for i := 0; i < len(locations); i++ {
++		if err := ctx.Err(); err != nil {
++			errs = append(errs, err)
++			break
++		}
++		l := locations[i]
+ 		r, err := n.FetchFrom(ctx, a, l)
+ 		if err != nil {
+ 			errs = append(errs, fmt.Errorf("%s: %w", l, err))
++			if ctx.Err() != nil {
++				break
++			}
+ 			continue
+ 		}
+ 		if r.Failure == nil {
+-			return r, errs
++			// FetchFrom saves only fully verified heads and checks each one against
++			// the head now held, preserving key pinning and rollback rejection.
++			// Keep the first equal head so a later unchanged copy cannot erase an update.
++			if best == nil || r.Publication.Head.Sequence > best.Publication.Head.Sequence {
++				best = r
++			}
++			for _, copy := range r.Publication.Head.KnownCopies {
++				copy = base(strings.TrimSpace(copy))
++				if copy != "" && !seen[copy] {
++					seen[copy] = true
++					locations = append(locations, copy)
++				}
++			}
++			continue
+ 		}
+ 		lastFail = r
+ 		errs = append(errs, fmt.Errorf("%s: %w", l, r.Failure))
+ 	}
++	if best != nil {
++		return best, errs
++	}
+ 	if lastFail != nil {
+ 		return lastFail, errs
+ 	}
+diff --git a/spec/SPEC.md b/spec/SPEC.md
+index e203963..4c86eb4 100644
+--- a/spec/SPEC.md
++++ b/spec/SPEC.md
+@@ -368,6 +368,12 @@ the authority.
+ `forum://{pub}` by trying, in order, any location it was given, then the `known_copies` of the newest verified head it
+ holds.
+ 
++The reference implementation continues after a valid response to seek a newer fully verified head. It tries each
++normalized location once per fetch, including new hints from fully verified publications. Each accepted head is checked
++against the head then held (§8), so later stale or conflicting responses cannot replace it. Failures from individual
++locations are retained alongside the best successful result. This discovers the newest fully verified copy reached,
++not a guarantee of global freshness when other copies are unknown or unreachable.
++
+ ## 10. Test vectors
+ 
+ | File | Covers | Status |
+-- 
+2.51.1
+
+
+From 32aa23a2df852367cb7c3b2eb1bc0f7ca4887dba Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Mon, 19 Oct 2026 13:40:51 -0400
+Subject: [PATCH 2/2] Make replica synchronization concurrent, atomic, and
+ observable
+
+---
+ README.md                     |  15 ++-
+ cmd/forum/main.go             |   9 +-
+ cmd/forum/replication_test.go |  81 ++++++++++++
+ e2e/concurrent_fetch_test.go  | 236 ++++++++++++++++++++++++++++++++++
+ e2e/freshness_test.go         |  32 +++--
+ mcp/mcp.go                    |  23 +++-
+ mcp/mcp_test.go               |  54 ++++++++
+ node/fetch.go                 | 105 +++++++++++----
+ node/node.go                  |  12 +-
+ spec/SPEC.md                  |  16 ++-
+ spec/devlog.md                |   8 ++
+ store/store.go                |  25 ++++
+ web/helpers.go                |  15 ++-
+ web/writer.go                 |   7 +-
+ 14 files changed, 579 insertions(+), 59 deletions(-)
+ create mode 100644 cmd/forum/replication_test.go
+ create mode 100644 e2e/concurrent_fetch_test.go
+
+diff --git a/README.md b/README.md
+index 7a1f4ed..150cc79 100644
+--- a/README.md
++++ b/README.md
+@@ -35,9 +35,18 @@ forum read forum://<publication>
+ 
+ Anything that fails a check is reported as UNVERIFIED with the failing check and is never stored (`forum log`).
+ 
+-Fetch, follow and sync try every known copy, including locations learned from verified publications, and retain the
+-highest fully verified head sequence. Each location is tried once per fetch. An unavailable or invalid copy does not
+-discard a successful result; a newer version can only be found if one of the reachable copies carries it.
++Fetch, follow and sync search known copies, including the last successful HTTP source and locations learned from
++verified publications, and retain the highest fully verified head sequence. Fetches run up to four locations at once,
++try each location once, and stop discovery at 64 locations with a warning. Each location has a 30-second deadline for
++its head and missing content together. Cancellation stops queued work and drains active requests.
++
++An unavailable or invalid copy does not discard a successful result. Its failure is included in the output; head
++fetch failures and verification failures are also recorded by `forum log`. A newer version can only be found if one
++of the reached copies carries it. An unchanged verified copy does not prove global freshness. Concurrent fetches,
++imports and local publishing cannot replace a stored head with an older or conflicting one.
++
++`forum sync` exits with status 2 if a followed publication cannot be fetched and verified. MCP fetch/follow/sync
++likewise mark failed operations as errors; successful fetches with failed alternatives retain their warnings.
+ 
+ ## People and agents, as equals
+ 
+diff --git a/cmd/forum/main.go b/cmd/forum/main.go
+index 7c6d3fd..6728cbd 100644
+--- a/cmd/forum/main.go
++++ b/cmd/forum/main.go
+@@ -328,11 +328,16 @@ func main() {
+ 	case "sync":
+ 		fs.Parse(rest)
+ 		reports, err := n.Sync(ctx)
++		failed := false
++		for _, rep := range reports {
++			fmt.Println(web.Describe(rep.Address, rep.Result, rep.Errors))
++			failed = failed || rep.Result == nil || rep.Result.Failure != nil
++		}
+ 		if err != nil {
+ 			die("%v", err)
+ 		}
+-		for _, rep := range reports {
+-			fmt.Println(web.Describe(rep.Address, rep.Result, rep.Errors))
++		if failed {
++			os.Exit(2)
+ 		}
+ 	case "read":
+ 		fs.Parse(rest)
+diff --git a/cmd/forum/replication_test.go b/cmd/forum/replication_test.go
+new file mode 100644
+index 0000000..6591d5a
+--- /dev/null
++++ b/cmd/forum/replication_test.go
+@@ -0,0 +1,81 @@
++package main
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"os/exec"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/Pnakotic-Codebase/forum.p2p/node"
++	"github.com/Pnakotic-Codebase/forum.p2p/web"
++)
++
++func TestCLIReplicationProcess(t *testing.T) {
++	if os.Getenv("FORUM_CLI_TEST") != "1" {
++		return
++	}
++	for i, a := range os.Args {
++		if a == "--" {
++			os.Args = append([]string{"forum"}, os.Args[i+1:]...)
++			main()
++			os.Exit(0)
++		}
++	}
++	os.Exit(99)
++}
++
++func TestSyncExitStatusAndWarnings(t *testing.T) {
++	author, err := node.Open(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer author.Close()
++	if _, err := author.Init(); err != nil {
++		t.Fatal(err)
++	}
++	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		http.Error(w, "offline", http.StatusServiceUnavailable)
++	}))
++	defer down.Close()
++	pub, err := author.NewPublication("", "Notes", "", []string{down.URL})
++	if err != nil {
++		t.Fatal(err)
++	}
++	up := httptest.NewServer(web.NewPublic(author))
++	defer up.Close()
++	dir := t.TempDir()
++	run := func(args ...string) (string, int) {
++		t.Helper()
++		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++		defer cancel()
++		argv := append([]string{"-test.run=^TestCLIReplicationProcess$", "--", "--home", dir}, args...)
++		cmd := exec.CommandContext(ctx, os.Args[0], argv...)
++		cmd.Env = append(os.Environ(), "FORUM_CLI_TEST=1")
++		out, err := cmd.CombinedOutput()
++		if err == nil {
++			return string(out), 0
++		}
++		if e, ok := err.(*exec.ExitError); ok {
++			return string(out), e.ExitCode()
++		}
++		t.Fatal(err)
++		return "", -1
++	}
++	out, code := run("follow", "forum://"+pub.String(), "--from", up.URL)
++	if code != 0 || !strings.Contains(out, "503") || !strings.Contains(out, "verified and stored") {
++		t.Fatalf("follow code=%d output=%s", code, out)
++	}
++	out, code = run("sync")
++	if code != 0 || !strings.Contains(out, "503") || !strings.Contains(out, "unchanged") {
++		t.Fatalf("partial sync code=%d output=%s", code, out)
++	}
++	up.Close()
++	out, code = run("sync")
++	if code != 2 || !strings.Contains(out, "could not be fetched") {
++		t.Fatalf("failed sync code=%d output=%s", code, out)
++	}
++}
+diff --git a/e2e/concurrent_fetch_test.go b/e2e/concurrent_fetch_test.go
+new file mode 100644
+index 0000000..2e1ef69
+--- /dev/null
++++ b/e2e/concurrent_fetch_test.go
+@@ -0,0 +1,236 @@
++package e2e
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/Pnakotic-Codebase/forum.p2p/addr"
++	"github.com/Pnakotic-Codebase/forum.p2p/node"
++	"github.com/Pnakotic-Codebase/forum.p2p/obj"
++	"github.com/Pnakotic-Codebase/forum.p2p/web"
++)
++
++func TestSlowFetchCannotOverwriteConcurrentUpdate(t *testing.T) {
++	author := open(t)
++	_, err := author.Init()
++	must(t, err)
++	pub, err := author.NewPublication("", "Notes", "", nil)
++	must(t, err)
++	doc, err := author.Publish(pub, node.Draft{Kind: obj.Post, Title: "Post", Body: "old"})
++	must(t, err)
++	old := snapshot(t, author, pub)
++	started, release := make(chan struct{}), make(chan struct{})
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	public := web.NewPublic(old)
++	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if strings.Contains(r.URL.Path, "/revision/") {
++			close(started)
++			select {
++			case <-release:
++			case <-r.Context().Done():
++				return
++			}
++		}
++		public.ServeHTTP(w, r)
++	}))
++	defer slow.Close()
++	_, err = author.Publish(pub, node.Draft{Document: doc.String(), Title: "Post", Body: "new"})
++	must(t, err)
++	reader := open(t)
++	// Two independent Store connections exercise the database boundary.
++	other, err := node.Open(reader.Dir)
++	must(t, err)
++	defer other.Close()
++	done := make(chan *node.FetchResult, 1)
++	go func() {
++		r, _ := other.FetchFrom(ctx, pub, slow.URL)
++		done <- r
++	}()
++	select {
++	case <-started:
++	case <-ctx.Done():
++		t.Fatal("slow fetch never reached its revision")
++	}
++	newURL := host(t, author).URL
++	r, err := reader.FetchFrom(ctx, pub, newURL)
++	must(t, err)
++	if r == nil || r.Failure != nil {
++		t.Fatalf("new fetch: %+v", r)
++	}
++	close(release)
++	select {
++	case r = <-done:
++	case <-ctx.Done():
++		t.Fatal("slow fetch did not finish")
++	}
++	if r == nil || r.Failure == nil || r.Failure.Check != "head sequence" {
++		t.Fatalf("late rollback was accepted: %+v", r)
++	}
++	want, err := author.Store.HeadEnv(pub)
++	must(t, err)
++	got, err := reader.Store.HeadEnv(pub)
++	must(t, err)
++	if !bytes.Equal(got, want) {
++		t.Fatal("late old head replaced the new head")
++	}
++	events, err := reader.Store.Events(10)
++	must(t, err)
++	found := false
++	for _, e := range events {
++		if e.Location == slow.URL {
++			found = true
++			if e.Verified {
++				t.Fatal("rejected concurrent rollback logged as verified")
++			}
++		}
++	}
++	if !found {
++		t.Fatal("rejected concurrent rollback was not logged")
++	}
++}
++
++func TestFetchCancellationDrainsWorkers(t *testing.T) {
++	started, stopped := make(chan struct{}, 10), make(chan struct{}, 10)
++	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		started <- struct{}{}
++		<-r.Context().Done()
++		stopped <- struct{}{}
++	}))
++	defer s.Close()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	deadline := time.After(5 * time.Second)
++	reader := open(t)
++	pub, err := addr.Parse(strings.Repeat("0", addr.Length))
++	must(t, err)
++	var locations []string
++	for i := 0; i < 10; i++ {
++		locations = append(locations, fmt.Sprintf("%s/copy%d", s.URL, i))
++	}
++	done := make(chan []error, 1)
++	go func() { _, errs := reader.Fetch(ctx, pub, locations...); done <- errs }()
++	for i := 0; i < 4; i++ {
++		select {
++		case <-started:
++		case <-deadline:
++			t.Fatal("workers did not start")
++		}
++	}
++	cancel()
++	select {
++	case errs := <-done:
++		found := false
++		for _, err := range errs {
++			found = found || errors.Is(err, context.Canceled)
++		}
++		if !found {
++			t.Fatalf("cancellation not reported: %v", errs)
++		}
++	case <-deadline:
++		t.Fatal("fetch did not cancel")
++	}
++	for i := 0; i < 4; i++ {
++		select {
++		case <-stopped:
++		case <-deadline:
++			t.Fatal("request left running after cancellation")
++		}
++	}
++	if len(started) != 0 {
++		t.Fatal("queued locations started after cancellation")
++	}
++}
++
++func TestFetchRemembersSuccessfulSource(t *testing.T) {
++	author := open(t)
++	_, err := author.Init()
++	must(t, err)
++	pub, err := author.NewPublication("", "Notes", "", nil)
++	must(t, err)
++	reader := open(t)
++	server := host(t, author)
++	fetchOK(t, reader, pub, server.URL)
++	_, err = author.Publish(pub, node.Draft{Kind: obj.Post, Title: "Later", Body: "New content"})
++	must(t, err)
++	r, errs := reader.Fetch(context.Background(), pub)
++	if r == nil || r.Failure != nil || r.Publication.Head.Sequence != 2 || r.Unchanged || len(errs) != 0 {
++		t.Fatalf("forgot successful source: %+v %v", r, errs)
++	}
++}
++
++func TestFetchParallelismAndDiscoveryBudget(t *testing.T) {
++	author := open(t)
++	_, err := author.Init()
++	must(t, err)
++	pub, err := author.NewPublication("", "Notes", "", nil)
++	must(t, err)
++	public := web.NewPublic(author)
++	var active, peak, requests atomic.Int32
++	started := make(chan struct{}, 100)
++	release := make(chan struct{})
++	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		n := active.Add(1)
++		defer active.Add(-1)
++		for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
++		}
++		requests.Add(1)
++		started <- struct{}{}
++		select {
++		case <-release:
++		case <-r.Context().Done():
++			return
++		}
++		// Each path prefix simulates a separate location carrying the same head.
++		r.URL.Path = r.URL.Path[strings.Index(r.URL.Path[1:], "/")+1:]
++		public.ServeHTTP(w, r)
++	}))
++	defer s.Close()
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	reader := open(t)
++	var locations []string
++	for i := 0; i < 70; i++ {
++		locations = append(locations, fmt.Sprintf("%s/copy%d", s.URL, i))
++	}
++	type result struct {
++		r    *node.FetchResult
++		errs []error
++	}
++	done := make(chan result, 1)
++	go func() {
++		r, errs := reader.Fetch(ctx, pub, locations...)
++		done <- result{r, errs}
++	}()
++	for i := 0; i < 4; i++ {
++		select {
++		case <-started:
++		case <-ctx.Done():
++			t.Fatal("fetch did not start four locations concurrently")
++		}
++	}
++	if requests.Load() != 4 {
++		t.Fatalf("started %d requests before a worker was released", requests.Load())
++	}
++	close(release)
++	var got result
++	select {
++	case got = <-done:
++	case <-ctx.Done():
++		t.Fatal("fetch did not finish")
++	}
++	if got.r == nil || got.r.Failure != nil || got.r.Unchanged || len(got.errs) != 1 || !strings.Contains(got.errs[0].Error(), "limited to 64") {
++		t.Fatalf("budget result: %+v %v", got.r, got.errs)
++	}
++	if requests.Load() != 64 || peak.Load() > 4 || active.Load() != 0 {
++		t.Fatalf("requests=%d peak=%d active=%d", requests.Load(), peak.Load(), active.Load())
++	}
++}
+diff --git a/e2e/freshness_test.go b/e2e/freshness_test.go
+index 063e3d1..482407e 100644
+--- a/e2e/freshness_test.go
++++ b/e2e/freshness_test.go
+@@ -13,6 +13,7 @@ import (
+ 	"github.com/Pnakotic-Codebase/forum.p2p/addr"
+ 	"github.com/Pnakotic-Codebase/forum.p2p/node"
+ 	"github.com/Pnakotic-Codebase/forum.p2p/obj"
++	"github.com/Pnakotic-Codebase/forum.p2p/verify"
+ 	"github.com/Pnakotic-Codebase/forum.p2p/web"
+ )
+ 
+@@ -75,29 +76,42 @@ func TestFetchNewestReplica(t *testing.T) {
+ 		want      *node.Node
+ 		location  string
+ 		wantError bool
++		prime     bool
+ 	}{
+-		{"old then middle then new", []string{oldURL, middleURL, newURL}, author, newURL, false},
+-		{"new then old", []string{newURL, oldURL}, author, newURL, true},
+-		{"new then same", []string{newURL, host(t, author).URL}, author, newURL, false},
+-		{"unavailable then new", []string{down.URL, newURL}, author, newURL, true},
+-		{"new then unavailable", []string{newURL, down.URL}, author, newURL, true},
+-		{"corrupt newest then middle", []string{bad.URL, middleURL}, middle, middleURL, true},
+-		{"new then conflicting", []string{newURL, forkURL}, author, newURL, true},
++		{"old then middle then new", []string{oldURL, middleURL, newURL}, author, newURL, false, false},
++		{"new then old", []string{newURL, oldURL}, author, newURL, false, false},
++		{"new then same", []string{newURL, host(t, author).URL}, author, "", false, false},
++		{"unavailable then new", []string{down.URL, newURL}, author, newURL, true, false},
++		{"new then unavailable", []string{newURL, down.URL}, author, newURL, true, false},
++		{"corrupt newest then middle", []string{bad.URL, middleURL}, middle, middleURL, true, false},
++		{"new then conflicting", []string{newURL, forkURL}, author, newURL, true, true},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
+ 			reader := open(t)
++			if tc.prime {
++				fetchOK(t, reader, pub, newURL)
++			}
+ 			r, errs := reader.Fetch(context.Background(), pub, tc.from...)
+ 			if r == nil || r.Failure != nil {
+ 				t.Fatalf("fetch failed: %+v %v", r, errs)
+ 			}
+-			if (len(errs) > 0) != tc.wantError {
++			if tc.wantError && len(errs) == 0 {
+ 				t.Fatalf("errors: %v, want errors: %v", errs, tc.wantError)
+ 			}
++			if !tc.wantError {
++				// Older responses may complete before or after the latest has been saved.
++				for _, err := range errs {
++					var f *verify.Failure
++					if !errors.As(err, &f) || f.Check != "head sequence" {
++						t.Fatalf("unexpected error: %v", err)
++					}
++				}
++			}
+ 			want, err := tc.want.Store.HeadEnv(pub)
+ 			must(t, err)
+ 			got, err := reader.Store.HeadEnv(pub)
+ 			must(t, err)
+-			if !bytes.Equal(got, want) || !bytes.Equal(r.Publication.HeadEnv, want) || r.Location != tc.location || r.Unchanged {
++			if !bytes.Equal(got, want) || !bytes.Equal(r.Publication.HeadEnv, want) || (tc.location != "" && r.Location != tc.location) || r.Unchanged != tc.prime {
+ 				t.Fatalf("wrong result or stored head: location=%s unchanged=%v sequence=%d", r.Location, r.Unchanged, r.Publication.Head.Sequence)
+ 			}
+ 		})
+diff --git a/mcp/mcp.go b/mcp/mcp.go
+index ec08bda..7c978f8 100644
+--- a/mcp/mcp.go
++++ b/mcp/mcp.go
+@@ -166,7 +166,11 @@ func tools() []tool {
+ 					return "", err
+ 				}
+ 				r, errs := s.Node.Fetch(ctx, a, str(args, "from"))
+-				return web.Describe(a, r, errs), nil
++				message := web.Describe(a, r, errs)
++				if r == nil || r.Failure != nil {
++					return "", errors.New(message)
++				}
++				return message, nil
+ 			}),
+ 		newTool("follow", "Fetch, verify and keep a publication in sync; this node then re-hosts it.", true,
+ 			map[string]prop{"address": addrProp, "from": {Type: "string", Description: "http://host:port to fetch from"}}, []string{"address", "from"},
+@@ -176,17 +180,26 @@ func tools() []tool {
+ 					return "", err
+ 				}
+ 				r, errs := s.Node.Follow(ctx, a, str(args, "from"))
+-				return web.Describe(a, r, errs), nil
++				message := web.Describe(a, r, errs)
++				if r == nil || r.Failure != nil {
++					return "", errors.New(message)
++				}
++				return message, nil
+ 			}),
+ 		newTool("sync", "Refresh every followed publication from its known locations.", true, nil, nil,
+ 			func(ctx context.Context, s *Server, _ map[string]any) (string, error) {
+ 				reports, err := s.Node.Sync(ctx)
+-				if err != nil {
+-					return "", err
+-				}
++				failed := err != nil
+ 				var out []string
+ 				for _, r := range reports {
+ 					out = append(out, "- "+web.Describe(r.Address, r.Result, r.Errors))
++					failed = failed || r.Result == nil || r.Result.Failure != nil
++				}
++				if err != nil {
++					out = append(out, "- "+err.Error())
++				}
++				if failed {
++					return "", errors.New(strings.Join(out, "\n"))
+ 				}
+ 				if len(out) == 0 {
+ 					return "Nothing followed yet.", nil
+diff --git a/mcp/mcp_test.go b/mcp/mcp_test.go
+index 6b581a7..e4550b9 100644
+--- a/mcp/mcp_test.go
++++ b/mcp/mcp_test.go
+@@ -4,10 +4,13 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"encoding/json"
++	"net/http"
++	"net/http/httptest"
+ 	"strings"
+ 	"testing"
+ 
+ 	"github.com/Pnakotic-Codebase/forum.p2p/node"
++	"github.com/Pnakotic-Codebase/forum.p2p/web"
+ )
+ 
+ type reply struct {
+@@ -20,6 +23,57 @@ type reply struct {
+ 	Error *struct{ Message string } `json:"error"`
+ }
+ 
++func TestReplicationReportsFailures(t *testing.T) {
++	author, err := node.Open(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer author.Close()
++	if _, err := author.Init(); err != nil {
++		t.Fatal(err)
++	}
++	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		http.Error(w, "offline", http.StatusServiceUnavailable)
++	}))
++	defer down.Close()
++	pub, err := author.NewPublication("", "Notes", "", []string{down.URL})
++	if err != nil {
++		t.Fatal(err)
++	}
++	up := httptest.NewServer(web.NewPublic(author))
++	defer up.Close()
++	reader, err := node.Open(t.TempDir())
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer reader.Close()
++	s := &Server{Node: reader}
++	args := map[string]any{"address": "forum://" + pub.String(), "from": down.URL}
++	rs := session(t, s, call(1, "fetch", args), call(2, "follow", args))
++	for _, r := range rs[1:] {
++		if !r.Result.IsError || !strings.Contains(r.Result.Content[0].Text, "503") {
++			t.Fatalf("failed request reported success: %+v", r)
++		}
++	}
++	fs, err := reader.Store.Follows()
++	if err != nil || len(fs) != 0 {
++		t.Fatalf("failed follow persisted: %v %v", fs, err)
++	}
++	args["from"] = up.URL
++	rs = session(t, s, call(3, "follow", args), call(4, "sync", nil))
++	for _, r := range rs[1:] {
++		text := r.Result.Content[0].Text
++		if r.Result.IsError || !strings.Contains(text, "verified") || !strings.Contains(text, "503") || strings.Contains(text, "up to date") {
++			t.Fatalf("partial success did not retain warning: %+v", r)
++		}
++	}
++	up.Close()
++	rs = session(t, s, call(5, "sync", nil))
++	if !rs[1].Result.IsError || !strings.Contains(rs[1].Result.Content[0].Text, "could not be fetched") {
++		t.Fatalf("failed sync reported success: %+v", rs[1])
++	}
++}
++
+ func session(t *testing.T, s *Server, calls ...string) []reply {
+ 	t.Helper()
+ 	var in bytes.Buffer
+diff --git a/node/fetch.go b/node/fetch.go
+index 24cac8a..414a9dc 100644
+--- a/node/fetch.go
++++ b/node/fetch.go
+@@ -7,6 +7,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"net/url"
+ 	"strings"
+ 	"time"
+ 
+@@ -21,6 +22,9 @@ const (
+ 	maxObject   = 16 << 20
+ 	maxAsset    = 64 << 20
+ 	httpTimeout = 30 * time.Second
++	// Bound discovery fan-out and total work even when signed hints contain cycles.
++	fetchConcurrency = 4
++	maxLocations     = 64
+ )
+ 
+ var client = &http.Client{Timeout: httpTimeout}
+@@ -86,8 +90,12 @@ type FetchResult struct {
+ }
+ 
+ func (n *Node) FetchFrom(ctx context.Context, a addr.ID, location string) (*FetchResult, error) {
++	// One deadline covers the head and all missing revisions and assets.
++	ctx, cancel := context.WithTimeout(ctx, httpTimeout)
++	defer cancel()
+ 	env, err := get(ctx, ObjectURL(location, a, "head"), maxObject)
+ 	if err != nil {
++		n.Store.Log(a, location, &verify.Failure{Check: "head fetch", Detail: err.Error()})
+ 		return nil, err
+ 	}
+ 	held, err := n.Store.Held(a)
+@@ -95,14 +103,20 @@ func (n *Node) FetchFrom(ctx context.Context, a addr.ID, location string) (*Fetc
+ 		return nil, err
+ 	}
+ 	p, f := verify.Full(a, env, held, remote{ctx, location, a, n.Store})
+-	n.Store.Log(a, location, f)
+ 	if f != nil {
++		n.Store.Log(a, location, f)
+ 		return &FetchResult{Failure: f, Location: location}, nil
+ 	}
+ 	unchanged := held != nil && held.Sequence == p.Head.Sequence
+ 	if err := n.Store.Save(p, location); err != nil {
++		// Another fetch or writer may have advanced the stored head during verification.
++		if errors.As(err, &f) {
++			n.Store.Log(a, location, f)
++			return &FetchResult{Failure: f, Location: location}, nil
++		}
+ 		return nil, err
+ 	}
++	n.Store.Log(a, location, nil)
+ 	return &FetchResult{Publication: p, Location: location, Unchanged: unchanged}, nil
+ }
+ 
+@@ -119,6 +133,13 @@ func (n *Node) Locations(a addr.ID, first ...string) []string {
+ 	for _, l := range first {
+ 		add(l)
+ 	}
++	// A successful explicit fetch remains usable even if the author lists no copies.
++	// Bundle labels and local publications (source "self") are not network hints.
++	if source, err := n.Store.Source(a); err == nil {
++		if u, err := url.Parse(source); err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" {
++			add(source)
++		}
++	}
+ 	if p, err := n.Store.Load(a); err == nil {
+ 		for _, l := range p.Head.KnownCopies {
+ 			add(l)
+@@ -128,50 +149,79 @@ func (n *Node) Locations(a addr.ID, first ...string) []string {
+ }
+ 
+ func (n *Node) Fetch(ctx context.Context, a addr.ID, first ...string) (*FetchResult, []error) {
++	held, err := n.Store.Held(a)
++	if err != nil {
++		return nil, []error{err}
++	}
+ 	var errs []error
+ 	var best *FetchResult
+ 	var lastFail *FetchResult
+-	locations := n.Locations(a, first...)
+-	seen := make(map[string]bool, len(locations))
+-	for _, l := range locations {
++	var locations []string
++	seen := make(map[string]bool)
++	limited := false
++	add := func(l string) {
++		l = base(strings.TrimSpace(l))
++		if l == "" || seen[l] {
++			return
++		}
++		if len(locations) == maxLocations {
++			if !limited {
++				errs = append(errs, fmt.Errorf("discovery limited to %d locations; some copies were not checked", maxLocations))
++				limited = true
++			}
++			return
++		}
+ 		seen[l] = true
++		locations = append(locations, l)
+ 	}
+-	// Continue past a valid response: another copy may have a newer signed head.
+-	// Each normalized location is tried once, including hints learned along the way.
+-	for i := 0; i < len(locations); i++ {
+-		if err := ctx.Err(); err != nil {
+-			errs = append(errs, err)
++	for _, l := range n.Locations(a, first...) {
++		add(l)
++	}
++	type outcome struct {
++		location string
++		result   *FetchResult
++		err      error
++	}
++	done := make(chan outcome, fetchConcurrency)
++	next, active := 0, 0
++	for next < len(locations) || active > 0 {
++		for ctx.Err() == nil && next < len(locations) && active < fetchConcurrency {
++			l := locations[next]
++			next++
++			active++
++			go func() {
++				r, err := n.FetchFrom(ctx, a, l)
++				done <- outcome{l, r, err}
++			}()
++		}
++		if active == 0 {
+ 			break
+ 		}
+-		l := locations[i]
+-		r, err := n.FetchFrom(ctx, a, l)
+-		if err != nil {
+-			errs = append(errs, fmt.Errorf("%s: %w", l, err))
+-			if ctx.Err() != nil {
+-				break
+-			}
++		// Drain every started worker before returning, including on cancellation.
++		o := <-done
++		active--
++		if o.err != nil {
++			errs = append(errs, fmt.Errorf("%s: %w", o.location, o.err))
+ 			continue
+ 		}
++		r := o.result
+ 		if r.Failure == nil {
+-			// FetchFrom saves only fully verified heads and checks each one against
+-			// the head now held, preserving key pinning and rollback rejection.
+-			// Keep the first equal head so a later unchanged copy cannot erase an update.
+ 			if best == nil || r.Publication.Head.Sequence > best.Publication.Head.Sequence {
+ 				best = r
+ 			}
+ 			for _, copy := range r.Publication.Head.KnownCopies {
+-				copy = base(strings.TrimSpace(copy))
+-				if copy != "" && !seen[copy] {
+-					seen[copy] = true
+-					locations = append(locations, copy)
+-				}
++				add(copy)
+ 			}
+ 			continue
+ 		}
+ 		lastFail = r
+-		errs = append(errs, fmt.Errorf("%s: %w", l, r.Failure))
++		errs = append(errs, fmt.Errorf("%s: %w", o.location, r.Failure))
++	}
++	if err := ctx.Err(); err != nil {
++		errs = append(errs, err)
+ 	}
+ 	if best != nil {
++		best.Unchanged = held != nil && held.Sequence == best.Publication.Head.Sequence
+ 		return best, errs
+ 	}
+ 	if lastFail != nil {
+@@ -206,8 +256,11 @@ func (n *Node) Sync(ctx context.Context) ([]SyncReport, error) {
+ 	}
+ 	var out []SyncReport
+ 	for _, f := range fs {
++		if err := ctx.Err(); err != nil {
++			return out, err
++		}
+ 		r, errs := n.Fetch(ctx, f.Address, f.Origin)
+ 		out = append(out, SyncReport{f.Address, r, errs})
+ 	}
+-	return out, nil
++	return out, ctx.Err()
+ }
+diff --git a/node/node.go b/node/node.go
+index 6617bf6..7849c26 100644
+--- a/node/node.go
++++ b/node/node.go
+@@ -471,9 +471,17 @@ func (n *Node) Import(raw []byte, label string) (addr.ID, *verify.Failure, error
+ 		return a, nil, err
+ 	}
+ 	p, f := verify.Full(a, b.Head, held, src)
+-	n.Store.Log(a, label, f)
+ 	if f != nil {
++		n.Store.Log(a, label, f)
+ 		return a, f, nil
+ 	}
+-	return a, nil, n.Store.Save(p, label)
++	if err := n.Store.Save(p, label); err != nil {
++		if errors.As(err, &f) {
++			n.Store.Log(a, label, f)
++			return a, f, nil
++		}
++		return a, nil, err
++	}
++	n.Store.Log(a, label, nil)
++	return a, nil, nil
+ }
+diff --git a/spec/SPEC.md b/spec/SPEC.md
+index 4c86eb4..c2948d8 100644
+--- a/spec/SPEC.md
++++ b/spec/SPEC.md
+@@ -365,12 +365,20 @@ the authority.
+ | `GET {base}/forum/v0/{pub}/bundle` | bundle |
+ 
+ `{pub}` is the 22-character publication address. Responses are `application/vnd.forum.v0`. A reader resolves
+-`forum://{pub}` by trying, in order, any location it was given, then the `known_copies` of the newest verified head it
+-holds.
++`forum://{pub}` using locations it was given and the `known_copies` of verified heads it holds. Locations remain
++untrusted hints; only the signed bytes establish authority.
+ 
+ The reference implementation continues after a valid response to seek a newer fully verified head. It tries each
+-normalized location once per fetch, including new hints from fully verified publications. Each accepted head is checked
+-against the head then held (§8), so later stale or conflicting responses cannot replace it. Failures from individual
++normalized location once per fetch, including its last successful HTTP source and new hints from fully verified publications.
++It queues explicit locations first, then the stored source, then signed hints; up to four locations run concurrently and
++results are processed as they finish. Discovery is limited to 64 locations per fetch, with a warning when more are
++available. Each location has a 30-second deadline spanning its head and missing revisions/assets. Cancellation stops
++new work and waits for started workers to finish. These are reference-implementation limits, not wire-format rules.
++
++Each accepted head is checked against the head then held (§8) again inside the database write transaction, so concurrent
++fetches, imports and local publishing cannot replace it with a stale or conflicting head. For distinct signed heads at
++the same sequence, the first committed head remains held and later conflicting heads are rejected; this is not consensus.
++Failures from individual
+ locations are retained alongside the best successful result. This discovers the newest fully verified copy reached,
+ not a guarantee of global freshness when other copies are unknown or unreachable.
+ 
+diff --git a/spec/devlog.md b/spec/devlog.md
+index 8cebb61..b3b84dc 100644
+--- a/spec/devlog.md
++++ b/spec/devlog.md
+@@ -131,3 +131,11 @@
+ - `forum mcp`: stdio MCP server (JSON-RPC, protocol 2025-06-18, no SDK dependency) with the same powers as the writer and CLI: list_publications, read, fetch, follow, sync, new_publication, publish (new or revision), remove, set_details, add_asset, verification_log. `--read-only` offers only the reading tools. The seed phrase is not offered over MCP.
+ - Tests: `mcp` (an agent creates a publication with a custom salt, publishes, revises, reads both views; read-only mode refuses publish) and `e2e/markdown_test.go` (every view in Markdown by suffix and by Accept; HTML unchanged; no llms.txt, no robots.txt). Full suite passes. Binary smoke: `forum mcp` on the replica home returned the edited post with its parent revision.
+ - GitHub: not pushed. This session has no GitHub access to Pnakotic-Codebase/forum.p2p (the API answers that the repository is not enabled for the session).
++
++## 2026-10-19: replica freshness and concurrent replication
++
++- Fixed first-valid-response selection: fetch/follow/sync retain the highest fully verified head reached, continue through failed copies, discover signed copy hints, and remember the last successful HTTP source. Equal later responses cannot erase the operation's changed status.
++- Bounded replication: four concurrent locations, 64 distinct normalized locations per fetch, 30 seconds per location across its head and missing content. Cycles are deduplicated, discovery overflow is reported, and cancellation drains started workers without starting queued locations.
++- Store.Save checks the signed head against the currently held head while holding SQLite's write lock. This closes the verification-to-save race across separate database connections and applies to network fetches, imports and local writers. Failed concurrent writes are logged as failures, not successes.
++- CLI, browser and MCP preserve partial-failure details. Unchanged copies are no longer described as globally up to date. Failed MCP fetch/follow/sync operations set isError; CLI sync returns status 2 when any followed publication cannot be refreshed. Head transport failures are included in the event log.
++- Regression coverage includes stale-first discovery, cached-source reuse, corrupt content, unavailable replicas, signed same-sequence conflicts, a slow rollback racing a newer fetch through an independent database connection, concurrency/discovery bounds, cancellation, and actual CLI/MCP output and status.
+diff --git a/store/store.go b/store/store.go
+index 972faf3..4fce274 100644
+--- a/store/store.go
++++ b/store/store.go
+@@ -111,6 +111,25 @@ func (s *Store) Save(p *verify.Publication, source string) error {
+ 	}
+ 	defer tx.Rollback()
+ 	a := p.Address.String()
++	// Take SQLite's writer lock before reading the held head. This serializes the
++	// check and replacement across Store instances and processes, not just goroutines.
++	if _, err := tx.Exec(`UPDATE publications SET address=address WHERE address=?`, a); err != nil {
++		return err
++	}
++	var held verify.Held
++	var seq int64
++	err = tx.QueryRow(`SELECT public_key, sequence, head_object FROM publications WHERE address=?`, a).
++		Scan(&held.PublicKey, &seq, &held.HeadBytes)
++	var previous *verify.Held
++	if err == nil {
++		held.Sequence = uint64(seq)
++		previous = &held
++	} else if !errors.Is(err, sql.ErrNoRows) {
++		return err
++	}
++	if _, _, f := verify.Head(p.Address, p.HeadEnv, previous); f != nil {
++		return f
++	}
+ 	if _, err := tx.Exec(`INSERT INTO publications(address, public_key, sequence, head_object, head_env, source, verified_at)
+ 		VALUES(?,?,?,?,?,?,?)
+ 		ON CONFLICT(address) DO UPDATE SET public_key=excluded.public_key, sequence=excluded.sequence,
+@@ -154,6 +173,12 @@ func (s *Store) HeadEnv(a addr.ID) ([]byte, error) {
+ 	return s.blob(`SELECT head_env FROM publications WHERE address = ?`, a.String())
+ }
+ 
++func (s *Store) Source(a addr.ID) (string, error) {
++	var source string
++	err := s.db.QueryRow(`SELECT source FROM publications WHERE address=?`, a.String()).Scan(&source)
++	return source, err
++}
++
+ func (s *Store) Revision(id digest.Digest) ([]byte, error) {
+ 	return s.blob(`SELECT env FROM revisions WHERE id = ?`, id[:])
+ }
+diff --git a/web/helpers.go b/web/helpers.go
+index 7ce690a..08a3a96 100644
+--- a/web/helpers.go
++++ b/web/helpers.go
+@@ -18,19 +18,26 @@ func metaOf(title, desc *string, copies []string) node.Meta {
+ }
+ 
+ func describe(a addr.ID, r *node.FetchResult, errs []error) string {
++	var message string
+ 	switch {
+ 	case r != nil && r.Failure == nil && r.Unchanged:
+-		return fmt.Sprintf("forum://%s is up to date (head %d, verified, from %s).", a, r.Publication.Head.Sequence, r.Location)
++		message = fmt.Sprintf("forum://%s verified copy unchanged (head %d, from %s).", a, r.Publication.Head.Sequence, r.Location)
+ 	case r != nil && r.Failure == nil:
+-		return fmt.Sprintf("forum://%s verified and stored (head %d, from %s).", a, r.Publication.Head.Sequence, r.Location)
++		message = fmt.Sprintf("forum://%s verified and stored (head %d, from %s).", a, r.Publication.Head.Sequence, r.Location)
+ 	case r != nil:
+-		return fmt.Sprintf("forum://%s from %s is UNVERIFIED and was not stored: %s: %s.", a, r.Location, r.Failure.Check, r.Failure.Detail)
++		message = fmt.Sprintf("forum://%s from %s is UNVERIFIED and was not stored: %s: %s.", a, r.Location, r.Failure.Check, r.Failure.Detail)
+ 	}
+ 	var s []string
+ 	for _, e := range errs {
+ 		s = append(s, e.Error())
+ 	}
+-	return fmt.Sprintf("forum://%s could not be fetched: %s", a, strings.Join(s, "; "))
++	if message == "" {
++		return fmt.Sprintf("forum://%s could not be fetched: %s", a, strings.Join(s, "; "))
++	}
++	if len(s) > 0 {
++		message += " Some copies could not be checked or accepted: " + strings.Join(s, "; ")
++	}
++	return message
+ }
+ 
+ func Describe(a addr.ID, r *node.FetchResult, errs []error) string { return describe(a, r, errs) }
+diff --git a/web/writer.go b/web/writer.go
+index 04d87ab..6901167 100644
+--- a/web/writer.go
++++ b/web/writer.go
+@@ -156,14 +156,13 @@ func (wr *Writer) sync(w http.ResponseWriter, r *http.Request) {
+ 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+ 	defer cancel()
+ 	reports, err := wr.Public.Node.Sync(ctx)
+-	if err != nil {
+-		back(w, r, "/w", err.Error())
+-		return
+-	}
+ 	var msgs []string
+ 	for _, rep := range reports {
+ 		msgs = append(msgs, describe(rep.Address, rep.Result, rep.Errors))
+ 	}
++	if err != nil {
++		msgs = append(msgs, err.Error())
++	}
+ 	if len(msgs) == 0 {
+ 		msgs = append(msgs, "Nothing followed yet.")
+ 	}
+-- 
+2.51.1
+
